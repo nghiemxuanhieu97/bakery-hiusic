@@ -1,0 +1,146 @@
+services:
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: hiusic-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - hiusic-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # SQL Server Database
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2019-latest
+    container_name: hiusic-sqlserver
+    environment:
+      - ACCEPT_EULA=Y
+      - SA_PASSWORD=${DB_PASSWORD}
+      - MSSQL_PID=Express
+    ports:
+      - "1433:1433"
+    volumes:
+      - sqlserver_data:/var/opt/mssql
+    networks:
+      - hiusic-network
+    healthcheck:
+      test: /opt/mssql-tools18/bin/sqlcmd -S localhost -U SA -P '${DB_PASSWORD}' -Q 'SELECT 1' -C
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Database Initializer
+  db-init:
+    image: mcr.microsoft.com/mssql-tools
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+    volumes:
+      - ./init-db.sql:/usr/src/app/init-db.sql
+    environment:
+      - SA_PASSWORD=${DB_PASSWORD}
+    networks:
+      - hiusic-network
+    command: >
+      bash -c "
+        echo 'Waiting for SQL Server to be ready...'
+        sleep 10
+        echo 'Creating databases...'
+        /opt/mssql-tools/bin/sqlcmd -S sqlserver -U SA -P ${DB_PASSWORD} -d master -i /usr/src/app/init-db.sql
+        echo 'Database initialization completed!'
+      "
+    restart: "no"
+
+  # Auth Service
+  auth-hiusic-service:
+    build:
+      context: ./../auth-hiusic-service
+      dockerfile: Dockerfile
+    container_name: auth-hiusic-service
+    ports:
+      - "7777:7777"
+    environment:
+      - DB_HOST=${DB_HOST}
+      - DB_NAME=${DB_AUTH_NAME}
+      - DB_USERNAME=${DB_USERNAME}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - SPRING_PROFILES_ACTIVE=${SPRING_PROFILES_ACTIVE}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      - EMAIL_PASSWORD=${EMAIL_PASSWORD}
+    volumes:
+      - auth_upload_data:/app/upload
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+    networks:
+      - hiusic-network
+    restart: unless-stopped
+
+  # Product Service
+  product-hiusic-service:
+    build:
+      context: ./../product-hiusic-service
+      dockerfile: Dockerfile
+    container_name: product-hiusic-service
+    ports:
+      - "8888:8888"
+    environment:
+      - DB_HOST=${DB_HOST}
+      - DB_NAME=${DB_PRODUCT_NAME}
+      - DB_USERNAME=${DB_USERNAME}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - SPRING_PROFILES_ACTIVE=${SPRING_PROFILES_ACTIVE}
+      - AUTH_SERVICE_URL=http://auth-hiusic-service:7777
+      - REDIS_HOST=${REDIS_HOST:-redis}
+      - REDIS_PORT=${REDIS_PORT:-6379}
+      - STATIC_LOCATION=/app/upload/
+    volumes:
+      - product_upload_data:/app/upload
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - hiusic-network
+    restart: unless-stopped
+
+  # Bakery UI (Angular Frontend)
+  bakery-hiusic-ui:
+    build:
+      context: ./../bakery-hiusic-ui
+      dockerfile: Dockerfile
+    container_name: bakery-hiusic-ui
+    ports:
+      - "80:80"
+    environment:
+      - NODE_ENV=production
+      - API_AUTH_URL=http://auth-hiusic-service:7777
+      - API_PRODUCT_URL=http://product-hiusic-service:8888
+    depends_on:
+      - auth-hiusic-service
+      - product-hiusic-service
+    networks:
+      - hiusic-network
+    restart: unless-stopped
+
+volumes:
+  sqlserver_data:
+    driver: local
+  redis_data:
+    driver: local
+  product_upload_data:
+    driver: local
+  auth_upload_data:
+    driver: local
+
+networks:
+  hiusic-network:
+    driver: bridge
